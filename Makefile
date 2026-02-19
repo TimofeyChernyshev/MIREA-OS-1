@@ -9,5 +9,3 @@ lib:
 
 install: 
 	sudo cp libcaesar.so /usr/local/lib/
-
-.PHONY:	all install
