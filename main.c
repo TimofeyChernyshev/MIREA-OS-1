@@ -22,8 +22,8 @@ int main(int argc, char* argv[]) {
     }
 
     // Получение функций из библиотеки
-    void (*caesar)(void*, void*, int) = (void(*)(void*,void*,int))dlsym(handle, "caesar");
-    void (*caesar_key)(char) = (void(*)(char))dlsym(handle, "caesar_key");
+    void (*caesar)(void*, void*, int) = dlsym(handle, "caesar");
+    void (*caesar_key)(char) = dlsym(handle, "caesar_key");
     
     if (!caesar || !caesar_key) {
         printf("Ошибка получения функций из библиотеки\n");
