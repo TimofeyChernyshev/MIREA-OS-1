@@ -12,5 +12,8 @@ caesar: main.c libcaesar.so
 install: 
 	sudo cp libcaesar.so /usr/local/lib/
 
+secure_copy: secure_copy.c libcaesar.so queue.c
+	$(CC) secure_copy.c -o secure_copy -L. -lcaesar -pthread queue.c -Wall
+
 test: libcaesar.so
 	python3 test_caesar.py
