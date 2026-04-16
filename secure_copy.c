@@ -42,7 +42,7 @@ void* worker(void* arg) {
         int file_index;
 
         struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
+        clock_gettime(CLOCK_MONOTONIC, &ts);
         ts.tv_sec += 5;
 
         if (pthread_mutex_timedlock(&a->file_index_mutex, &ts) == ETIMEDOUT) {
@@ -64,9 +64,9 @@ void* worker(void* arg) {
         struct timespec start_timespec;
         struct timespec end_timespec;
 
-        clock_gettime(CLOCK_REALTIME, &start_timespec);
+        clock_gettime(CLOCK_MONOTONIC, &start_timespec);
         int status = process_file(filename, a->out_dir);
-        clock_gettime(CLOCK_REALTIME, &end_timespec);
+        clock_gettime(CLOCK_MONOTONIC, &end_timespec);
 
         double end = end_timespec.tv_sec + end_timespec.tv_nsec / 1000000000.0;
         double start = start_timespec.tv_sec + start_timespec.tv_nsec / 1000000000.0;
@@ -187,7 +187,7 @@ double process_files(char** files, int total_files, char* out_dir, run_mode_t mo
     printf("Using %d worker thread(s)\n", workers_count);
     
     struct timespec total_start_timespec, total_end_timespec;
-    clock_gettime(CLOCK_REALTIME, &total_start_timespec);
+    clock_gettime(CLOCK_MONOTONIC, &total_start_timespec);
     
     pthread_t t[workers_count];
     for (int i = 0; i < workers_count; i++) {
@@ -197,7 +197,7 @@ double process_files(char** files, int total_files, char* out_dir, run_mode_t mo
         pthread_join(t[i], NULL);
     }
     
-    clock_gettime(CLOCK_REALTIME, &total_end_timespec);
+    clock_gettime(CLOCK_MONOTONIC, &total_end_timespec);
     
     double total_end = total_end_timespec.tv_sec + total_end_timespec.tv_nsec / 1000000000.0;
     double total_start = total_start_timespec.tv_sec + total_start_timespec.tv_nsec / 1000000000.0;
