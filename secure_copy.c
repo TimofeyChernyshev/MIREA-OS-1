@@ -93,6 +93,17 @@ void* worker(void* arg) {
 }
 
 int process_file(char* filename, char* out_dir) {
+    struct stat path_stat;
+    if (stat(filename, &path_stat) != 0) {
+        perror("stat failed");
+        return -1;
+    }
+
+    if (S_ISDIR(path_stat.st_mode)) {
+        printf("Skipping directory: %s\n", filename);
+        return 0;
+    }
+
     FILE* src = fopen(filename, "rb");
     if (!src) {
         perror("fopen src");
