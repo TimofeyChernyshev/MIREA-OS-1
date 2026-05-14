@@ -17,3 +17,10 @@ secure_copy: secure_copy.c libcaesar.so queue.c
 
 test: libcaesar.so
 	python3 test_caesar.py
+
+test_secure_copy: test_secure_copy.c secure_copy.h caesar.h
+	$(CC) $(CFLAGS) -c secure_copy.c -o secure_copy_no_main.o -DNO_MAIN
+	$(CC) $(CFLAGS) test_secure_copy.c secure_copy_no_main.o -L. -lcaesar -pthread -o test_secure_copy
+	./test_secure_copy
+	rm -f test_secure_copy
+	rm -f secure_copy_no_main.o
