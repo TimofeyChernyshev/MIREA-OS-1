@@ -1,12 +1,101 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
 #include <time.h>
 #include <libgen.h>
 #include <errno.h>
 #include <getopt.h>
+#include <signal.h>
 #include "caesar.h"
 #include "secure_copy.h"
+
+static void* g_secure_memory = NULL;
+
+// Обработчик SIGSEGV
+void sigsegv_handler(int sig, siginfo_t* info, void* context) {
+    (void)context;
+    if (g_secure_memory && info->si_addr == g_secure_memory) {
+        fprintf(stderr, "\n[ERROR] Security violation: Attempt to write to protected memory at %p\n", info->si_addr);
+        fprintf(stderr, "The encryption key is protected and cannot be modified!\n");
+        exit(1);
+    }
+    fprintf(stderr, "\n[ERROR] Segmentation fault at %p\n", info->si_addr);
+    exit(1);
+}
+
+// Функция для выделения защищенной памяти под ключ
+char* secure_key_alloc(char key) {
+    char* key_page = mmap(NULL, KEY_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_LOCKED, -1, 0);
+    
+    if (key_page == MAP_FAILED) {
+        perror("mmap failed");
+        return NULL;
+    }
+    
+    if (mprotect(key_page, KEY_SIZE, PROT_READ | PROT_WRITE) == -1) {
+        perror("mprotect failed");
+        munmap(key_page, KEY_SIZE);
+        return NULL;
+    }
+
+    memcpy(key_page, &key, sizeof(char));
+
+    if (mprotect(key_page, KEY_SIZE, PROT_READ) == -1) {
+        perror("mprotect failed");
+        munmap(key_page, KEY_SIZE);
+        return NULL;
+    }
+    
+    return key_page;
+}
+
+// Функция для безопасного получения ключа
+char secure_key_get(char* secure_key, pthread_mutex_t* mutex) {
+    if (!secure_key) return 0;
+
+    char key;
+
+    pthread_mutex_lock(mutex);
+
+    if (mprotect(secure_key, KEY_SIZE, PROT_READ | PROT_WRITE) == -1) {
+        perror("mprotect for read failed");
+        pthread_mutex_unlock(mutex);
+        return 0;
+    }
+
+    memcpy(&key, secure_key, sizeof(char));
+
+    if (mprotect(secure_key, KEY_SIZE, PROT_READ) == -1) {
+        perror("mprotect for restore failed");
+        pthread_mutex_unlock(mutex);
+        return 0;
+    }
+
+    pthread_mutex_unlock(mutex);
+    
+    return key;
+}
+
+// Функция для безопасного освобождения ключа
+void secure_key_free(char** key_ptr) {
+    if (!key_ptr || !*key_ptr) return;
+    
+    if (mprotect(*key_ptr, KEY_SIZE, PROT_READ | PROT_WRITE) == -1) {
+        perror("mprotect for free failed");
+    }
+    
+    memset(*key_ptr, 0, KEY_SIZE);
+    
+    msync(*key_ptr, KEY_SIZE, MS_SYNC);
+    
+    if (munmap(*key_ptr, KEY_SIZE) == -1) {
+        perror("munmap failed");
+    }
+    
+    *key_ptr = NULL;
+}
+
 
 run_mode_t parse_mode(const char* arg) {
     if (strcmp(arg, "sequential") == 0) return MODE_SEQUENTIAL;
@@ -37,6 +126,8 @@ void print_statistics(thread_args_t* a, double total_time, run_mode_t mode) {
 void* worker(void* arg) {
     thread_args_t* a = arg;
 
+    char key = secure_key_get(a->secure_key, &a->secure_mutex);
+
     while (1) {
         char* filename;
         int file_index;
@@ -65,7 +156,7 @@ void* worker(void* arg) {
         struct timespec end_timespec;
 
         clock_gettime(CLOCK_MONOTONIC, &start_timespec);
-        int status = process_file(filename, a->out_dir);
+        int status = process_file(filename, a->out_dir, key);
         clock_gettime(CLOCK_MONOTONIC, &end_timespec);
 
         double end = end_timespec.tv_sec + end_timespec.tv_nsec / 1000000000.0;
@@ -92,7 +183,7 @@ void* worker(void* arg) {
     return NULL;
 }
 
-int process_file(char* filename, char* out_dir) {
+int process_file(char* filename, char* out_dir, char key) {
     struct stat path_stat;
     if (stat(filename, &path_stat) != 0) {
         perror("stat failed");
@@ -128,7 +219,7 @@ int process_file(char* filename, char* out_dir) {
     size_t n;
 
     while ((n = fread(buf, 1, BUF_SIZE, src)) > 0) {
-        caesar(buf, enc, n);
+        caesar(buf, enc, n, key);
         fwrite(enc, 1, n, dst);
     }
 
@@ -156,7 +247,7 @@ void log_write(FILE* log, char* filename, int status) {
     fflush(log);
 }
 
-double process_files(char** files, int total_files, char* out_dir, run_mode_t mode, file_stats_t** out_stats) {
+double process_files(char** files, int total_files, char* out_dir, run_mode_t mode, file_stats_t** out_stats, char key) {
     file_stats_t* stats = malloc(total_files * sizeof(file_stats_t));
     if (!stats) {
         perror("malloc");
@@ -169,6 +260,15 @@ double process_files(char** files, int total_files, char* out_dir, run_mode_t mo
         free(stats);
         return -1;
     }
+
+    char* secure_key = secure_key_alloc(key);
+    if (!secure_key) {
+        fprintf(stderr, "Failed to allocate secure memory for key\n");
+        free(stats);
+        fclose(log);
+        return -1;
+    }
+    g_secure_memory = secure_key;
     
     thread_args_t a = {
         .filenames = files,
@@ -177,13 +277,15 @@ double process_files(char** files, int total_files, char* out_dir, run_mode_t mo
         .completed_files = 0,
         .out_dir = out_dir,
         .log = log,
-        .stats = stats
+        .stats = stats,
+        .secure_key = secure_key,
     };
     
     pthread_mutex_init(&a.file_index_mutex, NULL);
     pthread_mutex_init(&a.counter_mutex, NULL);
     pthread_mutex_init(&a.log_mutex, NULL);
     pthread_mutex_init(&a.stats_mutex, NULL);
+    pthread_mutex_init(&a.secure_mutex, NULL);
     
     int workers_count;
     if (mode == MODE_SEQUENTIAL) {
@@ -225,13 +327,28 @@ double process_files(char** files, int total_files, char* out_dir, run_mode_t mo
     pthread_mutex_destroy(&a.counter_mutex);
     pthread_mutex_destroy(&a.log_mutex);
     pthread_mutex_destroy(&a.stats_mutex);
+    pthread_mutex_destroy(&a.secure_mutex);
+
+    secure_key_free(&a.secure_key);
     
     return total_time;
 }
 
+#ifndef NO_MAIN
+
 int main(int argc, char* argv[]) {
     if (argc < 4) {
         fprintf(stderr, "Usage: %s <--mode> <src_files> <dst_dir_path> <key>\n", argv[0]);
+        return 1;
+    }
+
+    struct sigaction sa;
+    sa.sa_sigaction = sigsegv_handler;
+    sa.sa_flags = SA_SIGINFO;
+    sigemptyset(&sa.sa_mask);
+    
+    if (sigaction(SIGSEGV, &sa, NULL) == -1) {
+        perror("sigaction failed");
         return 1;
     }
 
@@ -260,7 +377,12 @@ int main(int argc, char* argv[]) {
     char* out_dir = argv[argc - 2];
     char* key = argv[argc - 1];
 
-    caesar_key(key[0]);
+    if (strlen(key) != 1) {
+        fprintf(stderr, "key must be a single character\n");
+        return 1;
+    }
+    
+    char key_char = key[0];
 
     mkdir(out_dir, 0777);
 
@@ -275,13 +397,13 @@ int main(int argc, char* argv[]) {
             printf("Heuristic choose: parallel mode\n");
         }
 
-        seq_time = process_files(files, total_files, out_dir, MODE_SEQUENTIAL, &seq_stats);
+        seq_time = process_files(files, total_files, out_dir, MODE_SEQUENTIAL, &seq_stats, key_char);
         if (seq_time < 0) {
             fprintf(stderr, "Error running sequential mode\n");
             return 1;
         }
         
-        par_time = process_files(files, total_files, out_dir, MODE_PARALLEL, &par_stats);
+        par_time = process_files(files, total_files, out_dir, MODE_PARALLEL, &par_stats, key_char);
         if (par_time < 0) {
             fprintf(stderr, "Error running parallel mode\n");
             free(seq_stats);
@@ -294,14 +416,16 @@ int main(int argc, char* argv[]) {
         free(seq_stats);
         free(par_stats);
     } else if (mode == MODE_SEQUENTIAL) {
-        double time_taken = process_files(files, total_files, out_dir, MODE_SEQUENTIAL, &seq_stats);
+        double time_taken = process_files(files, total_files, out_dir, MODE_SEQUENTIAL, &seq_stats, key_char);
         if (time_taken < 0) return 1;
         free(seq_stats);
     } else if (mode == MODE_PARALLEL) {
-        double time_taken = process_files(files, total_files, out_dir, MODE_PARALLEL,  &par_stats);
+        double time_taken = process_files(files, total_files, out_dir, MODE_PARALLEL,  &par_stats, key_char);
         if (time_taken < 0) return 1;
         free(par_stats);
     }
 
     return 0;
 }
+
+#endif
