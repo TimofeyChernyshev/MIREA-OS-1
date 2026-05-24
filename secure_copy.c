@@ -552,40 +552,8 @@ void free_file_list(file_list_t* list) {
     free(list->items);
 }
 
-int mkdir_p(const char* path) {
-    char tmp[PATH_MAX];
-    snprintf(tmp, sizeof(tmp), "%s", path);
-    size_t len = strlen(tmp);
-
-    if (tmp[len - 1] == '/') {
-        tmp[len - 1] = 0;
-    }
-
-    for (char* p = tmp + 1; *p; p++) {
-        if (*p == '/') {
-            *p = 0;
-            mkdir(tmp, 0755);
-            *p = '/';
-        }
-    }
-
-    return mkdir(tmp, 0755);
-}
-
-void create_parent_dirs(const char* filepath) {
-    char tmp[PATH_MAX];
-
-    snprintf(tmp, sizeof(tmp), "%s", filepath);
-
-    char* last_slash = strrchr(tmp, '/');
-
-    if (!last_slash) {
-        return;
-    }
-
-    *last_slash = '\0';
-
-    mkdir_p(tmp);
+int compare_names(const void* a, const void* b) {
+    return strcmp(*(const char**)a, *(const char**)b);
 }
 
 int list_container(const char* container_path) {
@@ -595,135 +563,151 @@ int list_container(const char* container_path) {
         return -1;
     }
 
+    char** names = NULL;
+    uint32_t* sizes = NULL;
+    int count = 0;
+
     while (1) {
         file_entry_header_t header;
-
         size_t r = fread(&header, sizeof(header), 1, f);
-        if (r == 0) {
+        if (r == 0) break;
+
+        if (header.filename_len == 0 || header.filename_len > 4096) {
+            fprintf(stderr, "Corrupted filename_len=%u\n", header.filename_len);
             break;
         }
 
-        char filename[1024];
+        char* filename = malloc(header.filename_len + 1);
+        if (!filename) break;
 
-        memset(filename, 0, sizeof(filename));
+        r = fread(filename, 1, header.filename_len, f);
+        if (r != header.filename_len) {
+            free(filename);
+            break;
+        }
+        filename[header.filename_len] = '\0';
 
-        fread(filename, 1, header.filename_len, f);
-
-        printf("FILE: %s SIZE: %u\n", filename, header.file_size);
+        char** new_names = realloc(names, (count + 1) * sizeof(char*));
+        uint32_t* new_sizes = realloc(sizes, (count + 1) * sizeof(uint32_t));
+        if (!new_names || !new_sizes) {
+            free(filename);
+            break;
+        }
+        names = new_names;
+        sizes = new_sizes;
+        names[count] = filename;
+        sizes[count] = header.file_size;
+        count++;
 
         fseek(f, header.file_size, SEEK_CUR);
     }
 
     fclose(f);
 
+    qsort(names, count, sizeof(char*), compare_names);
+    for (int i = 0; i < count - 1; i++) {
+        for (int j = i + 1; j < count; j++) {
+            if (strcmp(names[i], names[j]) > 0) {
+                char* tmp_name = names[i];
+                names[i] = names[j];
+                names[j] = tmp_name;
+                uint32_t tmp_size = sizes[i];
+                sizes[i] = sizes[j];
+                sizes[j] = tmp_size;
+            }
+        }
+    }
+
+    for (int i = 0; i < count; i++) {
+        printf("FILE: %s SIZE: %u\n", names[i], sizes[i]);
+        free(names[i]);
+    }
+
+    free(names);
+    free(sizes);
     return 0;
 }
 
-int extract_container(const char* container_path, const char* output_dir, const char* key) {
-    FILE* f = fopen(container_path, "rb");
-
+int get_file(const char* image_path, const char* key, const char* output_file, const char* target_filename) {
+    FILE* f = fopen(image_path, "rb");
     if (!f) {
-        perror("fopen container");
+        perror("fopen image");
         return -1;
     }
 
     while (1) {
         file_entry_header_t header;
-
         size_t r = fread(&header, sizeof(header), 1, f);
-        if (r == 0) {
+        if (r == 0) break;
+
+        if (header.filename_len == 0 || header.filename_len > 4096) {
+            fprintf(stderr, "Corrupted filename_len=%u\n", header.filename_len);
             break;
         }
 
-        char filename[PATH_MAX];
-        memset(filename, 0, sizeof(filename));
-        if (header.filename_len >= sizeof(filename)) {
-            fprintf(stderr, "filename too long\n");
-            fclose(f);
-            return -1;
-        }
-
+        char* filename = malloc(header.filename_len + 1);
+        if (!filename) break;
         r = fread(filename, 1, header.filename_len, f);
-
         if (r != header.filename_len) {
-            fprintf(stderr, "failed to read filename\n");
-            fclose(f);
-            return -1;
+            free(filename);
+            break;
         }
+        filename[header.filename_len] = '\0';
 
-        char full_output[PATH_MAX];
-        snprintf(full_output, sizeof(full_output), "%s/%s", output_dir, filename);
-        create_parent_dirs(full_output);
+        int found = (strcmp(filename, target_filename) == 0);
+        free(filename);
 
-        FILE* out = fopen(full_output, "wb");
-        if (!out) {
-            perror("fopen output");
-            fclose(f);
-            return -1;
-        }
+        if (found) {
+            size_t key_len = strnlen(key, KEY_SIZE);
+            unsigned char derived_key[KEY_SIZE + SALT_SIZE];
+            memset(derived_key, 0, sizeof(derived_key));
+            memcpy(derived_key, key, key_len);
+            memcpy(derived_key + key_len, header.salt, SALT_SIZE);
 
-        size_t key_len = strnlen(key, KEY_SIZE);
-        unsigned char derived_key[KEY_SIZE + SALT_SIZE];
-        memset(derived_key, 0, sizeof(derived_key));
-        memcpy(derived_key, key, key_len);
-        memcpy(derived_key + key_len, header.salt, SALT_SIZE);
+            rc4_state_t* rc4 = rc4_init(derived_key, key_len + SALT_SIZE);
+            memset(derived_key, 0, sizeof(derived_key));
 
-        rc4_state_t* rc4 = rc4_init(derived_key, key_len + SALT_SIZE);
+            if (!rc4) {
+                fclose(f);
+                return -1;
+            }
 
-        memset(derived_key, 0, sizeof(derived_key));
+            FILE* out = fopen(output_file, "wb");
+            if (!out) {
+                perror("fopen output");
+                rc4_cleanup(&rc4);
+                fclose(f);
+                return -1;
+            }
 
-        if (!rc4) {
+            unsigned char buf[BUF_SIZE];
+            uint32_t remaining = header.file_size;
+
+            while (remaining > 0) {
+                size_t chunk = remaining > BUF_SIZE ? BUF_SIZE : remaining;
+                r = fread(buf, 1, chunk, f);
+                if (r != chunk) {
+                    fprintf(stderr, "failed to read encrypted data\n");
+                    break;
+                }
+                rc4_crypt(rc4, buf, chunk);
+                fwrite(buf, 1, chunk, out);
+                remaining -= chunk;
+            }
+
+            rc4_cleanup(&rc4);
             fclose(out);
             fclose(f);
-            return -1;
+            printf("Extracted: %s -> %s\n", target_filename, output_file);
+            return 0;
+        } else {
+            fseek(f, header.file_size, SEEK_CUR);
         }
-
-        unsigned char buf[BUF_SIZE];
-        uint32_t remaining = header.file_size;
-
-        while (remaining > 0) {
-            size_t chunk = remaining > BUF_SIZE ? BUF_SIZE : remaining;
-
-            r = fread(buf, 1, chunk, f);
-
-            if (r != chunk) {
-                fprintf(stderr, "failed to read encrypted data\n");
-
-                rc4_cleanup(&rc4);
-                fclose(out);
-                fclose(f);
-
-                return -1;
-            }
-
-            rc4_crypt(rc4, buf, chunk);
-
-            size_t written = fwrite(buf, 1, chunk, out);
-
-            if (written != chunk) {
-                perror("fwrite");
-
-                rc4_cleanup(&rc4);
-
-                fclose(out);
-                fclose(f);
-
-                return -1;
-            }
-
-            remaining -= chunk;
-        }
-
-        rc4_cleanup(&rc4);
-
-        fclose(out);
-
-        printf("Extracted: %s\n", full_output);
     }
 
     fclose(f);
-
-    return 0;
+    fprintf(stderr, "File '%s' not found in container\n", target_filename);
+    return -1;
 }
 
 #ifndef NO_MAIN
@@ -745,72 +729,62 @@ int main(int argc, char* argv[]) {
         {"mode", required_argument, 0, 'm'},
         {"add", no_argument, 0, 'a'},
         {"list", no_argument, 0, 'l'},
-        {"extract", no_argument, 0, 'x'},
+        {"get", no_argument, 0, 'g'},
+        {"key", required_argument, 0, 'k'},
+        {"image", required_argument, 0, 'i'},
+        {"out", required_argument, 0, 'o'},
         {0, 0, 0, 0}
     };
 
-    bool add_mode = false;
-    bool list_mode = false;
-    bool extract_mode = false;
+    char* key = NULL;
+    char* image_path = NULL;
+    char* output_file = NULL;
+    bool add_mode = false, list_mode = false, get_mode = false;
 
-    while ((opt = getopt_long(argc, argv, "m:alx", long_options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "algk:i:o:m:", long_options, NULL)) != -1) {
         switch (opt) {
-            case 'm':
-                mode = parse_mode(optarg);
-                break;
-            case 'a':
-                add_mode = true;
-                break;
-            case 'l':
-                list_mode = true;
-                break;
-            case 'x':
-                extract_mode = true;
+            case 'a': add_mode = true; break;
+            case 'l': list_mode = true; break;
+            case 'g': get_mode = true; break;
+            case 'k': key = optarg; break;
+            case 'i': image_path = optarg; break;
+            case 'o': output_file = optarg; break;
+            case 'm': 
+                if (strcmp(optarg, "parallel") == 0) mode = MODE_PARALLEL;
+                else mode = MODE_SEQUENTIAL;
                 break;
         }
     }
+
+    int remaining = argc - optind;
+    char** remaining_args = &argv[optind];
 
     if (list_mode) {
-        if (optind >= argc) {
-            fprintf(stderr, "Container path required\n");
+        if (!image_path) {
+            fprintf(stderr, "Usage: -list -image <img>\n");
             return 1;
         }
-
-        return list_container(argv[optind]);
+        return list_container(image_path);
     }
 
-    if (extract_mode) {
-        if (argc - optind < 3) {
-            fprintf(
-                stderr,
-                "Usage: --extract <container> <output_dir> <key>\n"
-            );
-
+    if (get_mode) {
+        if (!key || !image_path || !output_file || remaining != 1) {
+            fprintf(stderr, "Usage: -get -image <img> -key <key> -out <outfile> <filename>\n");
             return 1;
         }
-
-        return extract_container(
-            argv[optind],
-            argv[optind + 1],
-            argv[optind + 2]
-        );
+        return get_file(image_path, key, output_file, remaining_args[0]);
     }
 
     if (add_mode) {
-        if (argc - optind < 3) {
-            fprintf(
-                stderr,
-                "Usage: --add <files...> <container> <key>\n"
-            );
+        if (!key || !image_path || remaining == 0) {
+            fprintf(stderr, "Usage: -add -key <key> -image <img> files...\n");
             return 1;
         }
 
         file_list_t list;
         init_file_list(&list);
-        int input_count = argc - optind - 2;
-
-        for (int i = 0; i < input_count; i++) {
-            recursive_collect(argv[optind + i], &list);
+        for (int i = 0; i < remaining; i++) {
+            recursive_collect(remaining_args[i], &list);
         }
 
         if (list.count == 0) {
@@ -819,11 +793,7 @@ int main(int argc, char* argv[]) {
             return 1;
         }
 
-        char* container_path = argv[argc - 2];
-        char* key = argv[argc - 1];
-
-        int fd = open(container_path, O_CREAT | O_WRONLY, 0666);
-
+        int fd = open(image_path, O_CREAT | O_WRONLY, 0666);
         if (fd < 0) {
             perror("open container");
             free_file_list(&list);
@@ -831,17 +801,13 @@ int main(int argc, char* argv[]) {
         }
 
         file_stats_t* stats = NULL;
-
         double time_taken = process_files(list.items, list.count, fd, mode, &stats, key);
 
         close(fd);
         free(stats);
         free_file_list(&list);
 
-        if (time_taken < 0) {
-            return 1;
-        }
-
+        if (time_taken < 0) return 1;
         return 0;
     }
 
