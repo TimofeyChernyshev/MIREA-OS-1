@@ -7,7 +7,7 @@
 #include <errno.h>
 #include <getopt.h>
 #include <signal.h>
-#include "caesar.h"
+#include "rc4.h"
 #include "secure_copy.h"
 
 static void* g_secure_memory = NULL;
@@ -213,15 +213,23 @@ int process_file(char* filename, char* out_dir, char key) {
         return -1;
     }
 
-    char buf[BUF_SIZE];
-    char enc[BUF_SIZE];
+    unsigned char buf[BUF_SIZE];
+
+    rc4_state_t rc4;
 
     size_t n;
 
+    unsigned char rc4_key[1];
+    rc4_key[0] = (unsigned char)key;
+
+    rc4_init(&rc4, rc4_key, 1);
+
     while ((n = fread(buf, 1, BUF_SIZE, src)) > 0) {
-        caesar(buf, enc, n, key);
-        fwrite(enc, 1, n, dst);
+        rc4_crypt(&rc4, buf, n);
+        fwrite(buf, 1, n, dst);
     }
+
+    rc4_cleanup(&rc4);
 
     fclose(src);
     fclose(dst);
