@@ -4,6 +4,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include <errno.h>
+#include <stdio.h>
 
 struct rc4_state {
     unsigned char S[256];
