@@ -604,27 +604,28 @@ int list_container(const char* container_path) {
 
     fclose(f);
 
-    qsort(names, count, sizeof(char*), compare_names);
+    int* indices = malloc(count * sizeof(int));
+    for (int i = 0; i < count; i++) indices[i] = i;
+
     for (int i = 0; i < count - 1; i++) {
         for (int j = i + 1; j < count; j++) {
-            if (strcmp(names[i], names[j]) > 0) {
-                char* tmp_name = names[i];
-                names[i] = names[j];
-                names[j] = tmp_name;
-                uint32_t tmp_size = sizes[i];
-                sizes[i] = sizes[j];
-                sizes[j] = tmp_size;
+            if (strcmp(names[indices[i]], names[indices[j]]) > 0) {
+                int tmp = indices[i];
+                indices[i] = indices[j];
+                indices[j] = tmp;
             }
         }
     }
 
     for (int i = 0; i < count; i++) {
-        printf("FILE: %s SIZE: %u\n", names[i], sizes[i]);
-        free(names[i]);
+        int idx = indices[i];
+        printf("FILE: %s SIZE: %u\n", names[idx], sizes[idx]);
+        free(names[idx]);
     }
 
     free(names);
     free(sizes);
+    free(indices);
     return 0;
 }
 
