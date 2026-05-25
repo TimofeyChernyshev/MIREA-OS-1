@@ -793,7 +793,7 @@ int main(int argc, char* argv[]) {
             return 1;
         }
 
-        int fd = open(image_path, O_CREAT | O_WRONLY, 0666);
+        int fd = open(image_path, O_CREAT | O_WRONLY | O_APPEND, 0666);
         if (fd < 0) {
             perror("open container");
             free_file_list(&list);
