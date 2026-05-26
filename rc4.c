@@ -42,7 +42,7 @@ rc4_state_t* rc4_init(const unsigned char* key, int key_len) {
         swap(&state->S[i], &state->S[j]);
     }
 
-    if (mprotect(state, size, PROT_READ) == -1) {
+    if (mprotect(state, size, PROT_NONE) == -1) {
         perror("mprotect rc4 state");
         munmap(state, size);
         return NULL;
@@ -55,7 +55,7 @@ void rc4_crypt(rc4_state_t* state_ptr, unsigned char* data, size_t len) {
     struct rc4_state* state = (struct rc4_state*)state_ptr;
     size_t size = sizeof(struct rc4_state);
 
-    mprotect(state, size, PROT_READ | PROT_WRITE);
+    mprotect(state, size, PROT_WRITE);
     
     for (size_t n = 0; n < len; n++) {
         state->i = (state->i + 1) & 0xFF;
@@ -67,7 +67,7 @@ void rc4_crypt(rc4_state_t* state_ptr, unsigned char* data, size_t len) {
         data[n] ^= k;
     }
 
-    mprotect(state, size, PROT_READ);
+    mprotect(state, size, PROT_NONE);
 }
 
 void rc4_cleanup(rc4_state_t** state_ptr) {
@@ -76,7 +76,7 @@ void rc4_cleanup(rc4_state_t** state_ptr) {
     struct rc4_state* state = (struct rc4_state*)*state_ptr;
     size_t size = sizeof(struct rc4_state);
     
-    mprotect(state, size, PROT_READ | PROT_WRITE);
+    mprotect(state, size, PROT_WRITE);
     
     memset(state, 0, size);
     msync(state, size, MS_SYNC);
