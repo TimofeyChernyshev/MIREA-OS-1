@@ -28,58 +28,6 @@ void sigsegv_handler(int sig, siginfo_t* info, void* context) {
     exit(1);
 }
 
-void queue_init(write_queue_t* q) {
-    q->head = q->tail = NULL;
-    q->finished = 0;
-    pthread_mutex_init(&q->mutex, NULL);
-    pthread_cond_init(&q->cond, NULL);
-}
-
-void queue_push(write_queue_t* q, write_job_t* job) {
-    job->next = NULL;
-
-    pthread_mutex_lock(&q->mutex);
-
-    if (!q->tail) {
-        q->head = q->tail = job;
-    } else {
-        q->tail->next = job;
-        q->tail = job;
-    }
-
-    pthread_cond_signal(&q->cond);
-    pthread_mutex_unlock(&q->mutex);
-}
-
-write_job_t* queue_pop(write_queue_t* q) {
-    pthread_mutex_lock(&q->mutex);
-
-    while (!q->head && !q->finished) {
-        pthread_cond_wait(&q->cond, &q->mutex);
-    }
-
-    if (!q->head && q->finished) {
-        pthread_mutex_unlock(&q->mutex);
-        return NULL;
-    }
-
-    write_job_t* job = q->head;
-    q->head = job->next;
-
-    if (!q->head)
-        q->tail = NULL;
-
-    pthread_mutex_unlock(&q->mutex);
-    return job;
-}
-
-void queue_finish(write_queue_t* q) {
-    pthread_mutex_lock(&q->mutex);
-    q->finished = 1;
-    pthread_cond_broadcast(&q->cond);
-    pthread_mutex_unlock(&q->mutex);
-}
-
 // Функция для выделения защищенной памяти под ключ
 char* secure_key_alloc(char* key) {
     char* key_page = mmap(NULL, KEY_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_LOCKED, -1, 0);
@@ -203,11 +151,20 @@ void* worker(void* arg) {
 
         pthread_mutex_unlock(&a->file_index_mutex);
 
+        struct stat st;
+        stat(filename, &st);
+        size_t total_size = sizeof(file_entry_header_t) + strlen(filename) + st.st_size;
+
+        pthread_mutex_lock(&a->offset_mutex);
+        off_t offset = a->current_offset;
+        a->current_offset += total_size;
+        pthread_mutex_unlock(&a->offset_mutex);
+
         struct timespec start_timespec;
         struct timespec end_timespec;
 
         clock_gettime(CLOCK_MONOTONIC, &start_timespec);
-        int status = process_file(filename, key, a->queue);
+        int status = process_file(filename, key, a->container_fd, offset);
         clock_gettime(CLOCK_MONOTONIC, &end_timespec);
 
         double end = end_timespec.tv_sec + end_timespec.tv_nsec / 1000000000.0;
@@ -234,31 +191,7 @@ void* worker(void* arg) {
     return NULL;
 }
 
-void* writer_thread(void* arg) {
-    thread_args_t* a = arg;
-    write_queue_t* q = a->queue;
-
-    while (1) {
-        write_job_t* job = queue_pop(q);
-        if (!job) break;
-
-        pthread_mutex_lock(&a->container_mutex);
-
-        write(a->container_fd, &job->header, sizeof(job->header));
-        write(a->container_fd, job->filename, job->header.filename_len);
-        write(a->container_fd, job->data, job->data_size);
-
-        pthread_mutex_unlock(&a->container_mutex);
-
-        free(job->filename);
-        free(job->data);
-        free(job);
-    }
-
-    return NULL;
-}
-
-int process_file(char* filename, char* key, write_queue_t* queue) {
+int process_file(char* filename, char* key, int fd, off_t base_offset) {
     struct stat path_stat;
     if (stat(filename, &path_stat) != 0) {
         perror("stat failed");
@@ -301,54 +234,24 @@ int process_file(char* filename, char* key, write_queue_t* queue) {
 
     memset(derived_key, 0, sizeof(derived_key));
 
-    uint8_t* encrypted_data = malloc(header.file_size);
-    if (!encrypted_data) {
-        perror("malloc encrypted_data");
-        rc4_cleanup(&rc4);
-        fclose(src);
-        return -1;
-    }
-
-    size_t total_read = 0;
+    off_t offset = base_offset;
+    
+    pwrite(fd, &header, sizeof(header), offset);
+    offset += sizeof(header);
+    
+    pwrite(fd, filename, header.filename_len, offset);
+    offset += header.filename_len;
+    
+    unsigned char buf[BUF_SIZE];
     size_t n;
-
-    while ((n = fread(encrypted_data + total_read, 1, header.file_size - total_read, src)) > 0) {
-        rc4_crypt(rc4, encrypted_data + total_read, n);
-        total_read += n;
+    while ((n = fread(buf, 1, BUF_SIZE, src)) > 0) {
+        rc4_crypt(rc4, buf, n);
+        pwrite(fd, buf, n, offset);
+        offset += n;
     }
-
-    fclose(src);
+    
     rc4_cleanup(&rc4);
-
-    if (total_read != header.file_size) {
-        fprintf(stderr, "read mismatch: expected %u got %zu\n", header.file_size, total_read);
-        free(encrypted_data);
-        return -1;
-    }
-
-    write_job_t* job = malloc(sizeof(write_job_t));
-    if (!job) {
-        perror("malloc job");
-        free(encrypted_data);
-        return -1;
-    }
-
-    job->header = header;
-
-    job->filename = strdup(filename);
-    if (!job->filename) {
-        perror("strdup");
-        free(encrypted_data);
-        free(job);
-        return -1;
-    }
-
-    job->data = encrypted_data;
-    job->data_size = header.file_size;
-
-    job->next = NULL;
-
-    queue_push(queue, job);
+    fclose(src);
 
     return 0;
 }
@@ -402,22 +305,17 @@ double process_files(char** files, int total_files, int container_fd, run_mode_t
         .log = log,
         .stats = stats,
         .secure_key = secure_key,
-        .container_fd = container_fd
+        .container_fd = container_fd,
+        .current_offset = 0
     };
 
-    write_queue_t write_queue;
-    queue_init(&write_queue);
-    a.queue = &write_queue; 
-
-    pthread_t writer_tid;
-    pthread_create(&writer_tid, NULL, writer_thread, &a);
-    
     pthread_mutex_init(&a.file_index_mutex, NULL);
     pthread_mutex_init(&a.counter_mutex, NULL);
     pthread_mutex_init(&a.log_mutex, NULL);
     pthread_mutex_init(&a.stats_mutex, NULL);
     pthread_mutex_init(&a.secure_mutex, NULL);
     pthread_mutex_init(&a.container_mutex, NULL);
+    pthread_mutex_init(&a.offset_mutex, NULL);
     
     int workers_count;
     if (mode == MODE_SEQUENTIAL) {
@@ -461,10 +359,9 @@ double process_files(char** files, int total_files, int container_fd, run_mode_t
     pthread_mutex_destroy(&a.stats_mutex);
     pthread_mutex_destroy(&a.secure_mutex);
     pthread_mutex_destroy(&a.container_mutex);
+    pthread_mutex_destroy(&a.offset_mutex);
 
     secure_key_free(&a.secure_key);
-    queue_finish(&write_queue);
-    pthread_join(writer_tid, NULL);
     
     return total_time;
 }
@@ -794,7 +691,7 @@ int main(int argc, char* argv[]) {
             return 1;
         }
 
-        int fd = open(image_path, O_CREAT | O_WRONLY | O_APPEND, 0666);
+        int fd = open(image_path, O_CREAT | O_WRONLY, 0666);
         if (fd < 0) {
             perror("open container");
             free_file_list(&list);

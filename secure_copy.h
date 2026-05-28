@@ -40,26 +40,6 @@ typedef struct {
     int capacity;
 } file_list_t;
 
-typedef struct write_job {
-    file_entry_header_t header;
-
-    char* filename;
-    uint8_t* data;
-    uint32_t data_size;
-
-    struct write_job* next;
-} write_job_t;
-
-typedef struct {
-    write_job_t* head;
-    write_job_t* tail;
-
-    pthread_mutex_t mutex;
-    pthread_cond_t cond;
-
-    int finished;
-} write_queue_t;
-
 typedef struct {
     char** filenames;
     int total_files;
@@ -82,11 +62,12 @@ typedef struct {
     int container_fd;
     pthread_mutex_t container_mutex;
 
-    write_queue_t* queue;
+    off_t current_offset;
+    pthread_mutex_t offset_mutex;
 } thread_args_t;
 
 void* worker(void* arg);
-int process_file(char* filename, char* key, write_queue_t* queue);
+int process_file(char* filename, char* key, int fd, off_t base_offset);
 void log_write(FILE* log, char* filename, int status);
 void print_statistics(thread_args_t* a, double total_time, run_mode_t mode);
 run_mode_t parse_mode(const char* arg);
