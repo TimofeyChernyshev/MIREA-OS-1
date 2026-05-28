@@ -742,7 +742,7 @@ int main(int argc, char* argv[]) {
     char* output_file = NULL;
     bool add_mode = false, list_mode = false, get_mode = false;
 
-    while ((opt = getopt_long(argc, argv, "algk:i:o:m:", long_options, NULL)) != -1) {
+    while ((opt = getopt_long_only(argc, argv, "", long_options, NULL)) != -1) {
         switch (opt) {
             case 'a': add_mode = true; break;
             case 'l': list_mode = true; break;
@@ -751,8 +751,8 @@ int main(int argc, char* argv[]) {
             case 'i': image_path = optarg; break;
             case 'o': output_file = optarg; break;
             case 'm': 
-                if (strcmp(optarg, "parallel") == 0) mode = MODE_PARALLEL;
-                else mode = MODE_SEQUENTIAL;
+                if (strcmp(optarg, "sequential") == 0) mode = MODE_SEQUENTIAL;
+                else mode = MODE_PARALLEL;
                 break;
         }
     }
